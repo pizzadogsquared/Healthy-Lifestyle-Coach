@@ -3,6 +3,7 @@ import express from "express";
 import helmet from "helmet";
 import fs from "fs";
 import path from "path";
+import session from "express-session";
 import { handleSignup } from "./signup.js";
 
 const app = express();
@@ -19,6 +20,13 @@ app.use(
       styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
       scriptSrc: ["'self'"]
     }
+  })
+);
+app.use(
+  session({
+    secret: "random",
+    resave: false,
+    saveUninitialized: false,
   })
 );
 app.use((req, res, next) => {
@@ -45,6 +53,84 @@ let surveyResults = {
 };
 // Temporary holding responses
 let allResponses = [];
+
+function requireLogin(req, res, next) {
+  if (!req.session.userEmail) return res.redirect("/login");
+  next();
+}
+
+function parseUserLine(line) {
+  if (!line || !line.trim()) return null;
+  const parts = line.split("/");
+  const [name, email, password, currentStreak, lastCheckInDate] = parts;
+
+  return {
+    name: name || "",
+    email: email || "",
+    password: password || "",
+    currentStreak: Number(currentStreak || 0),
+    lastCheckInDate: lastCheckInDate || "",
+  };
+}
+
+function toUserLine(u) {
+  return [
+    u.name,
+    u.email,
+    u.password,
+    String(u.currentStreak ?? 0),
+    u.lastCheckInDate ?? "",
+  ].join("/");
+}
+
+function readUsersFile() {
+  const raw = fs.readFileSync("users.txt", "utf8");
+  return raw
+    .split("\n")
+    .map(parseUserLine)
+    .filter(Boolean);
+}
+
+function writeUsersFile(users) {
+  const content = users.map(toUserLine).join("\n") + "\n";
+  fs.writeFileSync("users.txt", content, "utf8");
+}
+
+function isYesterday(lastDateStr, todayStr) {
+  // dates are "YYYY-MM-DD" because you use toLocaleDateString("en-CA")
+  if (!lastDateStr) return false;
+  const last = new Date(lastDateStr + "T00:00:00");
+  const today = new Date(todayStr + "T00:00:00");
+  const diffDays = Math.round((today - last) / (1000 * 60 * 60 * 24));
+  return diffDays === 1;
+}
+
+function updateUserStreakByEmail(email, todayStr) {
+  const users = readUsersFile();
+  const idx = users.findIndex(u => u.email === email);
+  if (idx === -1) return { currentStreak: 0 };
+
+  const u = users[idx];
+
+  // Already checked in today -> no change
+  if (u.lastCheckInDate === todayStr) {
+    return { currentStreak: u.currentStreak };
+  }
+
+  // Yesterday -> increment, else reset to 1
+  if (isYesterday(u.lastCheckInDate, todayStr)) {
+    u.currentStreak += 1;
+  } else {
+    u.currentStreak = 1;
+  }
+
+  u.lastCheckInDate = todayStr;
+  users[idx] = u;
+  writeUsersFile(users);
+
+  return { currentStreak: u.currentStreak };
+}
+
 
 function updateTimeline(date, section, avgScore) {
   const sectionKey = section === "general" ? "overall" : section;
@@ -87,11 +173,14 @@ app.get("/signup", (req, res) => {
 // Logout and reset progress
 app.get("/logout", (req, res) => {
   userProgress = {};
-  res.redirect("/login");
+  req.session.destroy(() => {
+    res.redirect("/login");
+  });
 });
 
+
 // Home page - Displays updated charts
-app.get("/home", (req, res) => {
+app.get("/home", requireLogin, (req, res) => {
   // Get the current day of the week
   const today = new Date().getDay();
 
@@ -167,9 +256,14 @@ app.get("/home", (req, res) => {
         advice: adviceMap[entry.question]
       }));
   }
-  
+  const users = readUsersFile();
+  const me = users.find(u => u.email === req.session.userEmail);
+  const streak = me ? me.currentStreak : 0;
+
+
   // Render the home page with the results
   res.render("home", {
+    streak,
     overallData: surveyResults.overall,
     mentalData: surveyResults.mental,
     physicalData: surveyResults.physical,
@@ -185,7 +279,7 @@ app.get("/home", (req, res) => {
 
 
 // Survey route
-app.get("/survey", (req, res) => {
+app.get("/survey", requireLogin, (req, res) => {
   const section = req.query.section || "general";
   const today = new Date().toLocaleDateString("en-CA"); // new
 
@@ -209,12 +303,12 @@ app.get("/survey", (req, res) => {
 });
 
 // Survey choice page
-app.get("/survey-choice", (req, res) => {
+app.get("/survey-choice", requireLogin, (req, res) => {
   res.render("survey-choice", { userProgress });
 });
 
 // Handle survey submission and update charts
-app.post("/submit-survey", (req, res) => {
+app.post("/submit-survey", requireLogin, (req, res) => {
   const { section } = req.body;
   const todayDate = new Date().toLocaleDateString("en-CA"); // new
   userProgress[section] = todayDate; //new 
@@ -318,10 +412,23 @@ app.post("/submit-survey", (req, res) => {
     surveyResults.physical.push(avgScore);
   }
 
-  if (userProgress.general && userProgress.mental && userProgress.physical) {
-    return res.redirect("/survey?section=completed");
-  }
-  return res.redirect("/survey-choice");
+  const todayStr = new Date().toLocaleDateString("en-CA");
+
+  const completedAllToday =
+  userProgress.general === todayStr &&
+  userProgress.mental === todayStr &&
+  userProgress.physical === todayStr;
+
+  if (completedAllToday) {
+  //update streak for the logged-in user
+    updateUserStreakByEmail(req.session.userEmail, todayStr);
+
+  return res.redirect("/survey?section=completed");
+}
+
+return res.redirect("/survey-choice");
+
+
 });
 
 
@@ -335,18 +442,26 @@ app.post("/login", (req, res) => {
       console.log(err);
       return res.send("Error reading user data");
     }
-    const users = data.split("\n").map(line => {
-      const [name, email, password] = line.split("/");
-      return { name, email, password };
-    });
+
+    const users = data
+      .split("\n")
+      .map(parseUserLine)
+      .filter(Boolean);
+
     const user = users.find(u => u.email === email && u.password === password);
+
     if (user) {
+      // store login in session
+      req.session.userEmail = user.email;
+      req.session.userName = user.name;
+
       res.redirect("/home");
     } else {
       res.render("login", { error: "Incorrect credentials. Please try again." });
     }
   });
 });
+
 
 // Handle user signup
 app.post("/signup", handleSignup);
